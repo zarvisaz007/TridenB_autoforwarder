@@ -3,14 +3,25 @@ import json
 import os
 import re
 import sys
+import time
+import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
-from telethon.tl.types import PeerChannel
 from telethon.errors import FloodWaitError
 
 TASKS_FILE = "tasks.json"
 MESSAGE_MAP_FILE = "message_map.json"
 SESSION_NAME = "tridenb_autoforwarder"
+MAX_LOG = 500
+LOOP_LIMIT = 10    # max forwards per task within LOOP_WINDOW seconds
+LOOP_WINDOW = 10   # seconds
+
+# ---------- Runtime state ----------
+forwarder_active = False
+paused_task_ids = set()   # task IDs paused this session
+loop_counter = {}          # task_id -> [timestamps]
+log_entries = []
+active_handlers = []       # (func, event_class) for cleanup on stop
 
 
 # ---------- Sync helpers ----------
@@ -56,8 +67,26 @@ def next_task_id(data):
     return max(t["id"] for t in tasks) + 1
 
 
+def add_log(msg):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{ts}] {msg}"
+    log_entries.append(entry)
+    if len(log_entries) > MAX_LOG:
+        log_entries.pop(0)
+    print(entry)
+
+
+def check_loop(task_id):
+    """Returns True if task is firing too fast — loop detected."""
+    now = time.time()
+    times = loop_counter.get(task_id, [])
+    times = [t for t in times if now - t < LOOP_WINDOW]
+    times.append(now)
+    loop_counter[task_id] = times
+    return len(times) >= LOOP_LIMIT
+
+
 def apply_filters(message, filters):
-    # Media checks
     if filters.get("skip_images") and message.photo:
         return (False, None)
     if filters.get("skip_audio") and (message.audio or message.voice):
@@ -67,14 +96,12 @@ def apply_filters(message, filters):
 
     text = message.text or ""
 
-    # Blacklist check
     blacklist = filters.get("blacklist_words", [])
     text_lower = text.lower()
     for word in blacklist:
         if word.lower() in text_lower:
             return (False, None)
 
-    # Clean pipeline
     modified = False
 
     clean_words = filters.get("clean_words", [])
@@ -100,6 +127,23 @@ def apply_filters(message, filters):
     return (True, None)
 
 
+# ---------- Async helpers ----------
+
+async def ainput(prompt=""):
+    """Non-blocking input — lets asyncio process Telegram events while waiting."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, input, prompt)
+
+
+async def send_copy(client, dest_id, message, modified_text):
+    """Send message as a fresh copy — no 'Forwarded from' header."""
+    if modified_text is not None:
+        return await client.send_message(dest_id, modified_text)
+    if message.media:
+        return await client.send_file(dest_id, file=message.media, caption=message.text or "")
+    return await client.send_message(dest_id, message.text or "")
+
+
 # ---------- Async CLI functions ----------
 
 async def get_channel_id(client):
@@ -110,7 +154,6 @@ async def get_channel_id(client):
         if dialog.is_channel or dialog.is_group:
             name = dialog.name or "(no name)"
             cid = dialog.entity.id
-            # Channels/supergroups use -100 prefix in bot API style
             if dialog.is_channel:
                 full_id = int(f"-100{cid}")
             else:
@@ -122,10 +165,10 @@ async def get_channel_id(client):
 async def create_task(client):
     data = load_tasks()
     print("\n--- Create Forwarding Task ---")
-    name = input("Task name: ").strip()
+    name = (await ainput("Task name: ")).strip()
 
-    src_raw = input("Source channel ID (e.g. -1001234567890): ").strip()
-    dst_raw = input("Destination channel IDs (comma-separated, e.g. -1001111111111,-1002222222222): ").strip()
+    src_raw = (await ainput("Source channel ID (e.g. -1001234567890): ")).strip()
+    dst_raw = (await ainput("Destination channel IDs (comma-separated): ")).strip()
 
     try:
         source_id = int(src_raw)
@@ -140,21 +183,21 @@ async def create_task(client):
 
     print("\nFilters (press Enter to skip / use defaults):")
 
-    def prompt_list(prompt):
-        raw = input(f"  {prompt} (comma-separated, blank=none): ").strip()
+    async def prompt_list(prompt):
+        raw = (await ainput(f"  {prompt} (comma-separated, blank=none): ")).strip()
         return [x.strip() for x in raw.split(",") if x.strip()] if raw else []
 
-    def prompt_bool(prompt, default=False):
-        val = input(f"  {prompt} [y/N]: ").strip().lower()
+    async def prompt_bool(prompt):
+        val = (await ainput(f"  {prompt} [y/N]: ")).strip().lower()
         return val in ("y", "yes")
 
-    blacklist = prompt_list("Blacklist words")
-    clean_words = prompt_list("Clean words (remove from text)")
-    clean_urls = prompt_bool("Remove URLs?")
-    clean_usernames = prompt_bool("Remove @usernames?")
-    skip_images = prompt_bool("Skip image messages?")
-    skip_audio = prompt_bool("Skip audio/voice messages?")
-    skip_videos = prompt_bool("Skip video messages?")
+    blacklist = await prompt_list("Blacklist words")
+    clean_words = await prompt_list("Clean words (remove from text)")
+    clean_urls = await prompt_bool("Remove URLs?")
+    clean_usernames = await prompt_bool("Remove @usernames?")
+    skip_images = await prompt_bool("Skip image messages?")
+    skip_audio = await prompt_bool("Skip audio/voice messages?")
+    skip_videos = await prompt_bool("Skip video messages?")
 
     task = {
         "id": next_task_id(data),
@@ -185,18 +228,19 @@ async def list_tasks():
         print("No tasks found.")
         return
 
-    print(f"\n{'ID':<5} {'Name':<20} {'Enabled':<8} {'Source':<22} {'Destinations'}")
-    print("-" * 90)
+    print(f"\n{'ID':<5} {'Name':<20} {'Enabled':<8} {'Paused':<8} {'Source':<22} {'Destinations'}")
+    print("-" * 100)
     for t in tasks:
         status = "Yes" if t.get("enabled") else "No"
+        paused = "Yes" if t["id"] in paused_task_ids else "No"
         dests = ", ".join(str(d) for d in t.get("destination_channel_ids", [t.get("destination_channel_id", "?")]))
-        print(f"{t['id']:<5} {t['name']:<20} {status:<8} {t['source_channel_id']:<22} {dests}")
+        print(f"{t['id']:<5} {t['name']:<20} {status:<8} {paused:<8} {t['source_channel_id']:<22} {dests}")
 
 
 async def toggle_task():
     await list_tasks()
     try:
-        tid = int(input("\nEnter task ID to toggle: ").strip())
+        tid = int((await ainput("\nEnter task ID to toggle: ")).strip())
     except ValueError:
         print("Invalid ID.")
         return
@@ -215,7 +259,7 @@ async def toggle_task():
 async def edit_task_filters():
     await list_tasks()
     try:
-        tid = int(input("\nEnter task ID to edit filters: ").strip())
+        tid = int((await ainput("\nEnter task ID to edit filters: ")).strip())
     except ValueError:
         print("Invalid ID.")
         return
@@ -233,27 +277,27 @@ async def edit_task_filters():
 
     print("\nEdit filters (press Enter to keep current value):")
 
-    def edit_list(key, prompt):
+    async def edit_list(key, prompt):
         current = filters.get(key, [])
-        raw = input(f"  {prompt} [{', '.join(current) or 'none'}]: ").strip()
+        raw = (await ainput(f"  {prompt} [{', '.join(current) or 'none'}]: ")).strip()
         if raw:
             filters[key] = [x.strip() for x in raw.split(",") if x.strip()]
 
-    def edit_bool(key, prompt):
+    async def edit_bool(key, prompt):
         current = filters.get(key, False)
-        raw = input(f"  {prompt} [{'Y' if current else 'N'}]: ").strip().lower()
+        raw = (await ainput(f"  {prompt} [{'Y' if current else 'N'}]: ")).strip().lower()
         if raw in ("y", "yes"):
             filters[key] = True
         elif raw in ("n", "no"):
             filters[key] = False
 
-    edit_list("blacklist_words", "Blacklist words")
-    edit_list("clean_words", "Clean words")
-    edit_bool("clean_urls", "Remove URLs?")
-    edit_bool("clean_usernames", "Remove @usernames?")
-    edit_bool("skip_images", "Skip images?")
-    edit_bool("skip_audio", "Skip audio?")
-    edit_bool("skip_videos", "Skip videos?")
+    await edit_list("blacklist_words", "Blacklist words")
+    await edit_list("clean_words", "Clean words")
+    await edit_bool("clean_urls", "Remove URLs?")
+    await edit_bool("clean_usernames", "Remove @usernames?")
+    await edit_bool("skip_images", "Skip images?")
+    await edit_bool("skip_audio", "Skip audio?")
+    await edit_bool("skip_videos", "Skip videos?")
 
     save_tasks(data)
     print("Filters updated.")
@@ -262,7 +306,7 @@ async def edit_task_filters():
 async def delete_task():
     await list_tasks()
     try:
-        tid = int(input("\nEnter task ID to delete: ").strip())
+        tid = int((await ainput("\nEnter task ID to delete: ")).strip())
     except ValueError:
         print("Invalid ID.")
         return
@@ -273,7 +317,7 @@ async def delete_task():
         print(f"Task {tid} not found.")
         return
 
-    confirm = input(f"Delete task '{task['name']}' (ID {tid})? [y/N]: ").strip().lower()
+    confirm = (await ainput(f"Delete task '{task['name']}' (ID {tid})? [y/N]: ")).strip().lower()
     if confirm in ("y", "yes"):
         data["tasks"] = [t for t in data["tasks"] if t["id"] != tid]
         save_tasks(data)
@@ -282,16 +326,13 @@ async def delete_task():
         print("Cancelled.")
 
 
-async def send_copy(client, dest_id, message, modified_text):
-    """Send message as a fresh copy — no 'Forwarded from' header."""
-    if modified_text is not None:
-        return await client.send_message(dest_id, modified_text)
-    if message.media:
-        return await client.send_file(dest_id, file=message.media, caption=message.text or "")
-    return await client.send_message(dest_id, message.text or "")
+async def start_forwarder(client):
+    global forwarder_active, active_handlers
 
+    if forwarder_active:
+        print("Forwarder is already running.")
+        return
 
-async def run_forwarder(client):
     data = load_tasks()
     enabled = [t for t in data.get("tasks", []) if t.get("enabled")]
     tasks_by_id = {t["id"]: t for t in data.get("tasks", [])}
@@ -307,7 +348,7 @@ async def run_forwarder(client):
 
     print("\nResolving source channels...")
     resolved_entities = []
-    resolved_ids = {}  # raw entity.id (without -100) -> stored sid
+    resolved_ids = {}
     for sid in list(source_to_tasks.keys()):
         try:
             entity = await client.get_entity(sid)
@@ -318,11 +359,8 @@ async def run_forwarder(client):
             print(f"  FAIL to resolve {sid}: {e}")
 
     if not resolved_entities:
-        print("No source channels could be resolved. Check your channel IDs.")
+        print("No source channels could be resolved.")
         return
-
-    print(f"\nForwarder running — watching {len(resolved_entities)} source(s) across {len(enabled)} task(s).")
-    print("Press Ctrl+C to stop.\n")
 
     def get_sid(chat_id):
         if chat_id is None:
@@ -330,48 +368,63 @@ async def run_forwarder(client):
         abs_id = abs(chat_id) % (10 ** 12)
         return resolved_ids.get(abs_id) or resolved_ids.get(chat_id)
 
-    @client.on(events.NewMessage(chats=resolved_entities))
     async def new_handler(event):
+        if not forwarder_active:
+            return
         sid = get_sid(event.chat_id)
         tasks_for_src = source_to_tasks.get(sid, [])
         text_preview = repr((event.message.text or "")[:60])
-        print(f"[MSG] chat={event.chat_id} text={text_preview}")
+        add_log(f"MSG chat={event.chat_id} text={text_preview}")
 
         mmap = load_message_map()
         key = mmap_key(sid, event.message.id)
         mmap.setdefault(key, [])
 
         for task in tasks_for_src:
+            if task["id"] in paused_task_ids:
+                add_log(f"  [PAUSED] '{task['name']}' skipped")
+                continue
+
+            # Loop protection
+            if check_loop(task["id"]):
+                paused_task_ids.add(task["id"])
+                add_log(f"  [LOOP] '{task['name']}' fired {LOOP_LIMIT}x in {LOOP_WINDOW}s — auto-paused!")
+                continue
+
             should_forward, modified_text = apply_filters(event.message, task["filters"])
             if not should_forward:
-                print(f"  [SKIP] '{task['name']}' — filtered")
+                add_log(f"  [SKIP] '{task['name']}' — filtered")
                 continue
+
             dest_ids = task.get("destination_channel_ids") or [task.get("destination_channel_id")]
             for dest_id in dest_ids:
                 try:
                     sent = await send_copy(client, dest_id, event.message, modified_text)
                     mmap[key].append({"task_id": task["id"], "dest": dest_id, "msg_id": sent.id})
-                    print(f"  [OK] '{task['name']}' → {dest_id} (msg {sent.id})")
+                    add_log(f"  [OK] '{task['name']}' → {dest_id} (msg {sent.id})")
                 except FloodWaitError as e:
-                    print(f"  [FLOOD] sleeping {e.seconds}s")
+                    add_log(f"  [FLOOD] sleeping {e.seconds}s")
                     await asyncio.sleep(e.seconds)
                 except Exception as e:
-                    print(f"  [ERR] '{task['name']}' → {dest_id}: {e}")
+                    add_log(f"  [ERR] '{task['name']}' → {dest_id}: {e}")
 
         save_message_map(mmap)
 
-    @client.on(events.MessageEdited(chats=resolved_entities))
     async def edit_handler(event):
+        if not forwarder_active:
+            return
         sid = get_sid(event.chat_id)
         key = mmap_key(sid, event.message.id)
         mmap = load_message_map()
         entries = mmap.get(key, [])
         if not entries:
             return
-        print(f"[EDIT] chat={event.chat_id} msg={event.message.id}")
+        add_log(f"EDIT chat={event.chat_id} msg={event.message.id}")
         for entry in entries:
             task = tasks_by_id.get(entry["task_id"])
             if not task:
+                continue
+            if entry["task_id"] in paused_task_ids:
                 continue
             should_forward, modified_text = apply_filters(event.message, task["filters"])
             if not should_forward:
@@ -379,12 +432,13 @@ async def run_forwarder(client):
             new_text = modified_text if modified_text is not None else (event.message.text or "")
             try:
                 await client.edit_message(entry["dest"], entry["msg_id"], text=new_text)
-                print(f"  [EDIT OK] → {entry['dest']} msg {entry['msg_id']}")
+                add_log(f"  [EDIT OK] → {entry['dest']} msg {entry['msg_id']}")
             except Exception as e:
-                print(f"  [EDIT ERR] {entry['dest']}: {e}")
+                add_log(f"  [EDIT ERR] {entry['dest']}: {e}")
 
-    @client.on(events.MessageDeleted(chats=resolved_entities))
     async def delete_handler(event):
+        if not forwarder_active:
+            return
         sid = get_sid(event.chat_id)
         mmap = load_message_map()
         changed = False
@@ -392,7 +446,6 @@ async def run_forwarder(client):
             key = mmap_key(sid, deleted_id) if sid else None
             entries = mmap.get(key, []) if key else []
             if not entries:
-                # Fallback: scan map for this msg_id
                 for k, v in mmap.items():
                     if k.endswith(f":{deleted_id}"):
                         entries = v
@@ -400,34 +453,100 @@ async def run_forwarder(client):
                         break
             if not entries:
                 continue
-            print(f"[DEL] msg={deleted_id}")
+            add_log(f"DEL msg={deleted_id}")
             for entry in entries:
+                if entry["task_id"] in paused_task_ids:
+                    continue
                 try:
                     await client.delete_messages(entry["dest"], [entry["msg_id"]])
-                    print(f"  [DEL OK] → {entry['dest']} msg {entry['msg_id']}")
+                    add_log(f"  [DEL OK] → {entry['dest']} msg {entry['msg_id']}")
                 except Exception as e:
-                    print(f"  [DEL ERR] {entry['dest']}: {e}")
+                    add_log(f"  [DEL ERR] {entry['dest']}: {e}")
             del mmap[key]
             changed = True
         if changed:
             save_message_map(mmap)
 
-    await client.run_until_disconnected()
+    # Register handlers
+    client.add_event_handler(new_handler, events.NewMessage(chats=resolved_entities))
+    client.add_event_handler(edit_handler, events.MessageEdited(chats=resolved_entities))
+    client.add_event_handler(delete_handler, events.MessageDeleted(chats=resolved_entities))
+
+    active_handlers.extend([
+        (new_handler, events.NewMessage),
+        (edit_handler, events.MessageEdited),
+        (delete_handler, events.MessageDeleted),
+    ])
+
+    forwarder_active = True
+    add_log(f"Forwarder STARTED — watching {len(resolved_entities)} source(s), {len(enabled)} task(s).")
+
+
+async def stop_forwarder(client):
+    global forwarder_active, active_handlers
+
+    if not forwarder_active:
+        print("Forwarder is not running.")
+        return
+
+    for func, event_type in active_handlers:
+        client.remove_event_handler(func, event_type)
+    active_handlers.clear()
+    forwarder_active = False
+    add_log("Forwarder STOPPED.")
+
+
+async def pause_task_menu():
+    await list_tasks()
+    try:
+        tid = int((await ainput("\nEnter task ID to pause/resume: ")).strip())
+    except ValueError:
+        print("Invalid ID.")
+        return
+
+    data = load_tasks()
+    task = next((t for t in data["tasks"] if t["id"] == tid), None)
+    if not task:
+        print(f"Task {tid} not found.")
+        return
+
+    if tid in paused_task_ids:
+        paused_task_ids.discard(tid)
+        loop_counter.pop(tid, None)  # reset loop counter on resume
+        print(f"Task '{task['name']}' resumed.")
+    else:
+        paused_task_ids.add(tid)
+        print(f"Task '{task['name']}' paused (this session only).")
+
+
+async def view_logs():
+    if not log_entries:
+        print("No logs yet.")
+        return
+    print(f"\n--- Logs (last {len(log_entries)} entries) ---")
+    for entry in log_entries[-50:]:  # show last 50
+        print(entry)
+    print()
 
 
 async def main_menu(client):
     while True:
-        print("\n=== TridenB Autoforwarder ===")
-        print("1. Get Channel ID")
-        print("2. Create Forwarding Task")
-        print("3. List Tasks")
-        print("4. Toggle Task (enable/disable)")
-        print("5. Edit Task Filters")
-        print("6. Delete Task")
-        print("7. Run Forwarder")
-        print("0. Exit")
+        status = "RUNNING" if forwarder_active else "STOPPED"
+        paused_info = f" | Paused tasks: {sorted(paused_task_ids)}" if paused_task_ids else ""
+        print(f"\n=== TridenB Autoforwarder === [Forwarder: {status}{paused_info}]")
+        print("1.  Get Channel ID")
+        print("2.  Create Forwarding Task")
+        print("3.  List Tasks")
+        print("4.  Toggle Task (enable/disable)")
+        print("5.  Edit Task Filters")
+        print("6.  Delete Task")
+        print("7.  Start Forwarder (background)")
+        print("8.  Stop Forwarder")
+        print("9.  Pause / Resume Task")
+        print("10. View Logs")
+        print("0.  Exit")
 
-        choice = input("\nSelect option: ").strip()
+        choice = (await ainput("\nSelect option: ")).strip()
 
         if choice == "1":
             await get_channel_id(client)
@@ -442,8 +561,19 @@ async def main_menu(client):
         elif choice == "6":
             await delete_task()
         elif choice == "7":
-            await run_forwarder(client)
+            await start_forwarder(client)
+        elif choice == "8":
+            await stop_forwarder(client)
+        elif choice == "9":
+            await pause_task_menu()
+        elif choice == "10":
+            await view_logs()
         elif choice == "0":
+            if forwarder_active:
+                confirm = (await ainput("Forwarder is running. Stop and exit? [y/N]: ")).strip().lower()
+                if confirm not in ("y", "yes"):
+                    continue
+                await stop_forwarder(client)
             print("Goodbye.")
             break
         else:
