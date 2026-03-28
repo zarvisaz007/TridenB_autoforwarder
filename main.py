@@ -9,9 +9,9 @@ import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
+from database import db
 
 TASKS_FILE = "tasks.json"
-MESSAGE_MAP_FILE = "message_map.json"
 SESSION_NAME = "tridenb_autoforwarder"
 MAX_LOG = 500
 LOOP_LIMIT = 10    # max forwards per task within LOOP_WINDOW seconds
@@ -23,6 +23,8 @@ paused_task_ids = set()   # task IDs paused this session
 loop_counter = {}          # task_id -> [timestamps]
 log_entries = []
 active_handlers = []       # (func, event_class) for cleanup on stop
+cleanup_task = None
+cancel_deletion = False
 
 
 # ---------- Sync helpers ----------
@@ -40,25 +42,6 @@ def load_tasks():
 def save_tasks(data):
     with open(TASKS_FILE, "w") as f:
         json.dump(data, f, indent=2)
-
-
-def load_message_map():
-    if not os.path.exists(MESSAGE_MAP_FILE):
-        return {}
-    try:
-        with open(MESSAGE_MAP_FILE, "r") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return {}
-
-
-def save_message_map(mmap):
-    with open(MESSAGE_MAP_FILE, "w") as f:
-        json.dump(mmap, f)
-
-
-def mmap_key(src_channel_id, src_msg_id):
-    return f"{src_channel_id}:{src_msg_id}"
 
 
 def next_task_id(data):
@@ -214,6 +197,17 @@ async def create_task(client):
     skip_audio = await prompt_bool("Skip audio/voice messages?")
     skip_videos = await prompt_bool("Skip video messages?")
 
+    delay_raw = (await ainput("  Delay before forwarding (seconds) [0]: ")).strip()
+    delay_seconds = int(delay_raw) if delay_raw.isdigit() else 0
+
+    img_del_raw = (await ainput("  Auto-delete images after (days) [0=off]: ")).strip()
+    image_delete_days = int(img_del_raw) if img_del_raw.isdigit() else 0
+
+    use_rewrite = await prompt_bool("  Enable Local AI Rewriting (Ollama)?")
+    rewrite_prompt = ""
+    if use_rewrite:
+        rewrite_prompt = (await ainput("  Rewrite prompt (e.g. 'Paraphrase to avoid copyright'): ")).strip()
+
     task = {
         "id": next_task_id(data),
         "name": name,
@@ -228,6 +222,10 @@ async def create_task(client):
             "skip_images": skip_images,
             "skip_audio": skip_audio,
             "skip_videos": skip_videos,
+            "delay_seconds": delay_seconds,
+            "image_delete_days": image_delete_days,
+            "rewrite_enabled": use_rewrite,
+            "rewrite_prompt": rewrite_prompt,
         },
     }
 
@@ -285,6 +283,10 @@ async def edit_filters_submenu(task, data):
         print(f"  5. Skip images       : {'Yes' if filters.get('skip_images') else 'No'}")
         print(f"  6. Skip audio        : {'Yes' if filters.get('skip_audio') else 'No'}")
         print(f"  7. Skip videos       : {'Yes' if filters.get('skip_videos') else 'No'}")
+        print(f"  8. Delay seconds     : {filters.get('delay_seconds', 0)}")
+        print(f"  9. Image delete days : {filters.get('image_delete_days', 0)}")
+        rew_info = 'Enabled' if filters.get('rewrite_enabled') else 'Disabled'
+        print(f"  10. Local AI Rewrite : {rew_info}")
         print(f"  0. Done")
 
         sub = (await ainput("\n  Select filter to edit (0 to finish): ")).strip()
@@ -333,6 +335,28 @@ async def edit_filters_submenu(task, data):
                 filters["skip_videos"] = True
             elif val in ("n", "no"):
                 filters["skip_videos"] = False
+            save_tasks(data)
+        elif sub == "8":
+            raw = (await ainput(f"    Delay in seconds [{filters.get('delay_seconds', 0)}]: ")).strip()
+            if raw.isdigit():
+                filters["delay_seconds"] = int(raw)
+                save_tasks(data)
+                print(f"    Saved: delay_seconds = {filters['delay_seconds']}")
+        elif sub == "9":
+            raw = (await ainput(f"    Image auto-delete (days) [{filters.get('image_delete_days', 0)}]: ")).strip()
+            if raw.isdigit():
+                filters["image_delete_days"] = int(raw)
+                save_tasks(data)
+                print(f"    Saved: image_delete_days = {filters['image_delete_days']}")
+        elif sub == "10":
+            val = (await ainput(f"    Enable Local AI Rewrite? (y/n) [{'Y' if filters.get('rewrite_enabled') else 'N'}]: ")).strip().lower()
+            if val in ("y", "yes"):
+                filters["rewrite_enabled"] = True
+                prompt_val = (await ainput("    Rewrite prompt: ")).strip()
+                if prompt_val:
+                    filters["rewrite_prompt"] = prompt_val
+            elif val in ("n", "no"):
+                filters["rewrite_enabled"] = False
             save_tasks(data)
         elif sub == "0":
             break
@@ -519,45 +543,67 @@ async def start_forwarder(client):
         text_preview = repr((event.message.text or "")[:60])
         add_log(f"MSG chat={event.chat_id} text={text_preview}")
 
-        mmap = load_message_map()
-        key = mmap_key(sid, event.message.id)
-        mmap.setdefault(key, [])
-
         # Detect if this message is a reply in the source channel
         reply_to_src_id = None
         if event.message.reply_to and event.message.reply_to.reply_to_msg_id:
             reply_to_src_id = event.message.reply_to.reply_to_msg_id
 
-        for task in tasks_for_src:
+        async def process_task(task, reply_to_src_id):
             if task["id"] in paused_task_ids:
                 add_log(f"  [PAUSED] '{task['name']}' skipped")
-                continue
+                return
 
             # Loop protection
             if check_loop(task["id"]):
                 paused_task_ids.add(task["id"])
                 add_log(f"  [LOOP] '{task['name']}' fired {LOOP_LIMIT}x in {LOOP_WINDOW}s — auto-paused!")
-                continue
+                return
 
             should_forward, modified_text = apply_filters(event.message, task["filters"])
             if not should_forward:
                 add_log(f"  [SKIP] '{task['name']}' — filtered")
-                continue
+                return
+
+            if task.get("filters", {}).get("rewrite_enabled"):
+                text_to_rewrite = modified_text if modified_text is not None else getattr(event.message, 'text', '')
+                if text_to_rewrite and text_to_rewrite.strip():
+                    try:
+                        import ollama_client
+                        prompt = task.get("filters", {}).get("rewrite_prompt", "Rewrite this to avoid copyright.")
+                        add_log(f"  [AI] '{task['name']}' rewriting via Ollama...")
+                        rewritten = await ollama_client.generate_with_ollama(text_to_rewrite, system_prompt=prompt)
+                        if not rewritten.startswith("[Ollama Error:"):
+                            modified_text = rewritten
+                            add_log(f"  [AI OK] Rewrote {len(text_to_rewrite)} chars to {len(rewritten)} chars.")
+                        else:
+                            add_log(f"  [AI WARN] {rewritten}")
+                    except Exception as e:
+                        add_log(f"  [AI ERR] {e}")
+
+            delay = task.get("filters", {}).get("delay_seconds", 0)
+            if delay > 0:
+                add_log(f"  [DELAY] '{task['name']}' waiting {delay}s")
+                await asyncio.sleep(delay)
 
             dest_ids = task.get("destination_channel_ids") or [task.get("destination_channel_id")]
             for dest_id in dest_ids:
                 # Find the corresponding reply target in this destination (if any)
                 reply_to_dest_id = None
                 if reply_to_src_id is not None:
-                    reply_key = mmap_key(sid, reply_to_src_id)
-                    for entry in mmap.get(reply_key, []):
-                        if entry["task_id"] == task["id"] and entry["dest"] == dest_id:
-                            reply_to_dest_id = entry["msg_id"]
-                            break
+                    reply_to_dest_id = db.get_reply_to_dest_id(task["id"], sid, reply_to_src_id, dest_id)
 
                 try:
                     sent = await send_copy(client, dest_id, event.message, modified_text, reply_to=reply_to_dest_id)
-                    mmap[key].append({"task_id": task["id"], "dest": dest_id, "msg_id": sent.id})
+                    text_for_db = modified_text if modified_text is not None else (event.message.text or "")
+                    db.log_message(
+                        task_id=task["id"],
+                        source_channel_id=sid,
+                        source_message_id=event.message.id,
+                        dest_channel_id=dest_id,
+                        dest_message_id=sent.id,
+                        has_image=bool(event.message.photo),
+                        text_content=text_for_db
+                    )
                     if reply_to_dest_id:
                         add_log(f"  [OK] '{task['name']}' → {dest_id} (msg {sent.id}, reply to {reply_to_dest_id})")
                     else:
@@ -568,15 +614,14 @@ async def start_forwarder(client):
                 except Exception as e:
                     add_log(f"  [ERR] '{task['name']}' → {dest_id}: {e}")
 
-        save_message_map(mmap)
+        for task in tasks_for_src:
+            asyncio.create_task(process_task(task, reply_to_src_id))
 
     async def edit_handler(event):
         if not forwarder_active:
             return
         sid = get_sid(event.chat_id)
-        key = mmap_key(sid, event.message.id)
-        mmap = load_message_map()
-        entries = mmap.get(key, [])
+        entries = db.get_dest_messages(sid, event.message.id)
         if not entries:
             return
         add_log(f"EDIT chat={event.chat_id} msg={event.message.id}")
@@ -591,26 +636,17 @@ async def start_forwarder(client):
                 continue
             new_text = modified_text if modified_text is not None else (event.message.text or "")
             try:
-                await client.edit_message(entry["dest"], entry["msg_id"], text=new_text)
-                add_log(f"  [EDIT OK] → {entry['dest']} msg {entry['msg_id']}")
+                await client.edit_message(entry["dest_channel_id"], entry["dest_message_id"], text=new_text)
+                add_log(f"  [EDIT OK] → {entry['dest_channel_id']} msg {entry['dest_message_id']}")
             except Exception as e:
-                add_log(f"  [EDIT ERR] {entry['dest']}: {e}")
+                add_log(f"  [EDIT ERR] {entry['dest_channel_id']}: {e}")
 
     async def delete_handler(event):
         if not forwarder_active:
             return
         sid = get_sid(event.chat_id)
-        mmap = load_message_map()
-        changed = False
         for deleted_id in event.deleted_ids:
-            key = mmap_key(sid, deleted_id) if sid else None
-            entries = mmap.get(key, []) if key else []
-            if not entries:
-                for k, v in mmap.items():
-                    if k.endswith(f":{deleted_id}"):
-                        entries = v
-                        key = k
-                        break
+            entries = db.remove_messages(sid, deleted_id)
             if not entries:
                 continue
             add_log(f"DEL msg={deleted_id}")
@@ -618,36 +654,100 @@ async def start_forwarder(client):
                 if entry["task_id"] in paused_task_ids:
                     continue
                 try:
-                    await client.delete_messages(entry["dest"], [entry["msg_id"]])
-                    add_log(f"  [DEL OK] → {entry['dest']} msg {entry['msg_id']}")
+                    await client.delete_messages(entry["dest_channel_id"], [entry["dest_message_id"]])
+                    add_log(f"  [DEL OK] → {entry['dest_channel_id']} msg {entry['dest_message_id']}")
                 except Exception as e:
-                    add_log(f"  [DEL ERR] {entry['dest']}: {e}")
-            del mmap[key]
-            changed = True
-        if changed:
-            save_message_map(mmap)
+                    add_log(f"  [DEL ERR] {entry['dest_channel_id']}: {e}")
+
+    async def cmd_delete_handler(event):
+        global cancel_deletion
+        if not forwarder_active:
+            return
+        add_log(f"  [CMD] received ..delete in {event.chat_id}")
+        cancel_deletion = False
+        try:
+            msg_ids = []
+            async for msg in client.iter_messages(event.chat_id, limit=3000):
+                if cancel_deletion:
+                    add_log(f"  [CMD] Deletion aborted by user in {event.chat_id}")
+                    break
+                if getattr(msg, 'out', True):
+                    msg_ids.append(msg.id)
+                if len(msg_ids) >= 100:
+                    await client.delete_messages(event.chat_id, msg_ids)
+                    msg_ids.clear()
+                    await asyncio.sleep(2)
+            if msg_ids:
+                await client.delete_messages(event.chat_id, msg_ids)
+            if not cancel_deletion:
+                add_log(f"  [CMD] wiped messages from {event.chat_id}")
+        except Exception as e:
+            add_log(f"  [CMD ERR] {event.chat_id}: {e}")
+
+    async def cmd_stop_handler(event):
+        global cancel_deletion
+        if not forwarder_active:
+            return
+        add_log(f"  [CMD] received ..stop in {event.chat_id}")
+        cancel_deletion = True
 
     # Register handlers
     client.add_event_handler(new_handler, events.NewMessage(chats=resolved_entities))
     client.add_event_handler(edit_handler, events.MessageEdited(chats=resolved_entities))
     client.add_event_handler(delete_handler, events.MessageDeleted(chats=resolved_entities))
+    client.add_event_handler(cmd_delete_handler, events.NewMessage(pattern=r"^\.\.delete$"))
+    client.add_event_handler(cmd_stop_handler, events.NewMessage(pattern=r"^\.\.stop$"))
 
     active_handlers.extend([
         (new_handler, events.NewMessage),
         (edit_handler, events.MessageEdited),
         (delete_handler, events.MessageDeleted),
+        (cmd_delete_handler, events.NewMessage),
+        (cmd_stop_handler, events.NewMessage),
     ])
+
+    async def image_cleanup_loop():
+        while forwarder_active:
+            try:
+                data = load_tasks()
+                for task in data.get("tasks", []):
+                    days = task.get("filters", {}).get("image_delete_days", 0)
+                    if days <= 0 or not task.get("enabled", True):
+                        continue
+                        
+                    age_seconds = days * 24 * 3600
+                    old_messages = db.get_old_image_messages(task["id"], age_seconds)
+                    for msg in old_messages:
+                        dest_id = msg['dest_channel_id']
+                        msg_id = msg['dest_message_id']
+                        try:
+                            await client.delete_messages(dest_id, [msg_id])
+                            db.delete_message_record(dest_id, msg_id)
+                            add_log(f"  [CLEANUP] Deleted old image {msg_id} from {dest_id} (Task {task['id']})")
+                        except Exception as e:
+                            db.delete_message_record(dest_id, msg_id) # delete from db anyway if it fails
+                        await asyncio.sleep(1)
+            except Exception as e:
+                add_log(f"  [CLEANUP LOOP ERR] {e}")
+            await asyncio.sleep(3600)
+
+    global cleanup_task
+    cleanup_task = asyncio.create_task(image_cleanup_loop())
 
     forwarder_active = True
     add_log(f"Forwarder STARTED — watching {len(resolved_entities)} source(s), {len(enabled)} task(s).")
 
 
 async def stop_forwarder(client):
-    global forwarder_active, active_handlers
+    global forwarder_active, active_handlers, cleanup_task
 
     if not forwarder_active:
         print("Forwarder is not running.")
         return
+
+    if cleanup_task:
+        cleanup_task.cancel()
+        cleanup_task = None
 
     for func, event_type in active_handlers:
         client.remove_event_handler(func, event_type)
@@ -693,6 +793,87 @@ async def view_logs():
     print()
 
 
+async def view_statistics():
+    data = load_tasks()
+    tasks_by_id = {t["id"]: t for t in data.get("tasks", [])}
+    stats = db.get_statistics()
+    
+    if not stats:
+        print("No statistics available yet.")
+        return
+        
+    print("\n--- Forwarding Statistics ---")
+    print(f"{'Task Name':<25} {'Total Msgs':<12} {'Images':<10} {'Last Active'}")
+    print("-" * 70)
+    for row in stats:
+        tname = tasks_by_id.get(row['task_id'], {}).get('name', f"Task {row['task_id']}")
+        last_act = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(row['last_active'])) if row['last_active'] else 'Never'
+        print(f"{tname:<25} {row['total_messages']:<12} {row['total_images'] or 0:<10} {last_act}")
+    print()
+
+async def view_threads():
+    stats = db.get_threads()
+    if not stats:
+        print("No threads recorded yet (or no newly tracked replies).")
+        return
+    print("\n--- Deep Thread / Replied Messages Report ---")
+    data = load_tasks()
+    tasks_by_id = {t["id"]: t for t in data.get("tasks", [])}
+    for row in stats:
+        tname = tasks_by_id.get(row['task_id'], {}).get('name', f"Task {row['task_id']}")
+        ptime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(row['parent_time']))
+        rtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(row['latest_reply_time']))
+        preview = row['text_content'][:40].replace('\n', ' ') + '...' if row['text_content'] else '[Media/Empty]'
+        print(f"[{tname}] Parent Msg {row['dest_message_id']} ({ptime})")
+        print(f"  └─ Text: {preview}")
+        print(f"  └─ Replies: {row['reply_count']} (Latest: {rtime})")
+    print()
+
+async def generate_finance_report():
+    tasks_data = load_tasks().get("tasks", [])
+    if not tasks_data:
+        print("No tasks available.")
+        return
+        
+    print("\nSelect task to generate report for:")
+    for i, t in enumerate(tasks_data):
+        print(f"  {i+1}. {t['name']}")
+        
+    choice = (await ainput("\nEnter task number: ")).strip()
+    if not choice.isdigit() or not (1 <= int(choice) <= len(tasks_data)):
+        print("Invalid choice.")
+        return
+        
+    task = tasks_data[int(choice)-1]
+    amount = (await ainput("How many recent messages to analyze? [50]: ")).strip()
+    limit = int(amount) if amount.isdigit() else 50
+    
+    stats = db.get_threads(limit=1000)
+    task_msgs = [row for row in stats if row['task_id'] == task['id']][:limit]
+    
+    if not task_msgs:
+        print("No recent messages found for this task.")
+        return
+        
+    print(f"\nGathering {len(task_msgs)} messages. Sending to local Ollama...")
+    combined_text = "\n\n---\n\n".join([f"Time: {time.strftime('%Y-%m-%d %H:%M', time.localtime(msg['parent_time']))}\n{msg['text_content']}" for msg in task_msgs])
+
+    system_prompt = (
+        "You are an expert financial analyst. Review the provided trading signals and messages. "
+        "Extract key information such as: Buy/Sell targets, Stop Losses, Hit Targets, and overall performance. "
+        "Summarize it into a concise, professional, Markdown-formatted financial report. "
+        "Ignore memes, chatter, or irrelevant links."
+    )
+    
+    try:
+        import ollama_client
+        report = await ollama_client.generate_with_ollama(combined_text, system_prompt=system_prompt)
+        print("\n================ FINANCIAL REPORT ================\n")
+        print(report)
+        print("\n==================================================\n")
+    except Exception as e:
+        print(f"Error communicating with Ollama: {e}")
+
 async def main_menu(client):
     while True:
         status = "RUNNING" if forwarder_active else "STOPPED"
@@ -709,6 +890,9 @@ async def main_menu(client):
         print("9.  Pause / Resume Task")
         print("10. View Logs")
         print("11. Duplicate Task")
+        print("12. View Statistics")
+        print("13. View Message Threads (Replies)")
+        print("14. Generate AI Finance Report (Ollama)")
         print("0.  Exit")
 
         choice = (await ainput("\nSelect option: ")).strip()
@@ -735,6 +919,12 @@ async def main_menu(client):
             await view_logs()
         elif choice == "11":
             await duplicate_task()
+        elif choice == "12":
+            await view_statistics()
+        elif choice == "13":
+            await view_threads()
+        elif choice == "14":
+            await generate_finance_report()
         elif choice == "0":
             if forwarder_active:
                 confirm = (await ainput("Forwarder is running. Stop and exit? [y/N]: ")).strip().lower()
