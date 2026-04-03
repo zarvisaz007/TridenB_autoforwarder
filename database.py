@@ -31,12 +31,6 @@ class DatabaseHandler:
             )
         ''')
         
-        try:
-            self.cursor.execute('ALTER TABLE messages ADD COLUMN reply_to_dest_id INTEGER')
-        except sqlite3.OperationalError:
-            pass
-
-        
         self.cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_src 
             ON messages(source_channel_id, source_message_id)
@@ -127,6 +121,44 @@ class DatabaseHandler:
             FROM messages
             GROUP BY task_id
         ''')
+        return [dict(row) for row in self.cursor.fetchall()]
+
+    def get_detailed_statistics(self, task_id=None):
+        now = int(time.time())
+        start_of_today = now - (now % 86400)
+        start_of_week = now - (now % 604800)
+
+        if task_id is not None:
+            self.cursor.execute('''
+                SELECT task_id,
+                       count(id) as total_messages,
+                       sum(has_image) as total_images,
+                       max(timestamp) as last_active,
+                       sum(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) as today_count,
+                       sum(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) as week_count
+                FROM messages
+                WHERE task_id = ?
+                GROUP BY task_id
+            ''', (start_of_today, start_of_week, task_id))
+        else:
+            self.cursor.execute('''
+                SELECT task_id,
+                       count(id) as total_messages,
+                       sum(has_image) as total_images,
+                       max(timestamp) as last_active,
+                       sum(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) as today_count,
+                       sum(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) as week_count
+                FROM messages
+                GROUP BY task_id
+            ''', (start_of_today, start_of_week))
+        return [dict(row) for row in self.cursor.fetchall()]
+
+    def get_recent_messages(self, task_id, limit=50):
+        self.cursor.execute('''
+            SELECT text_content, timestamp FROM messages
+            WHERE task_id = ? AND text_content != ''
+            ORDER BY timestamp DESC LIMIT ?
+        ''', (task_id, limit))
         return [dict(row) for row in self.cursor.fetchall()]
 
     def get_threads(self, limit=50):

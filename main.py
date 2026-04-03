@@ -11,6 +11,15 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from database import db
 
+# ---------- Colors ----------
+def c(text, code): return f"\033[{code}m{text}\033[0m"
+def green(t): return c(t, "32")
+def red(t): return c(t, "31")
+def yellow(t): return c(t, "33")
+def cyan(t): return c(t, "36")
+def bold(t): return c(t, "1")
+def dim(t): return c(t, "2")
+
 TASKS_FILE = "tasks.json"
 SESSION_NAME = "tridenb_autoforwarder"
 MAX_LOG = 500
@@ -61,13 +70,42 @@ def sync_paused_from_tasks():
             paused_task_ids.discard(t["id"])
 
 
+def colorize_log(entry):
+    """Apply color to a log entry for display."""
+    # Dim the timestamp portion
+    if entry.startswith("["):
+        bracket_end = entry.find("] ")
+        if bracket_end != -1:
+            ts_part = dim(entry[:bracket_end + 1])
+            rest = entry[bracket_end + 1:]
+        else:
+            ts_part = ""
+            rest = entry
+    else:
+        ts_part = ""
+        rest = entry
+
+    if "[OK]" in rest or "[EDIT OK]" in rest or "[DEL OK]" in rest or "[AI OK]" in rest:
+        return ts_part + green(rest)
+    elif "[ERR]" in rest or "[FAIL]" in rest or "[FLOOD]" in rest or "[EDIT ERR]" in rest or "[DEL ERR]" in rest or "[AI ERR]" in rest or "[CMD ERR]" in rest or "[LOOP]" in rest:
+        return ts_part + red(rest)
+    elif "[SKIP]" in rest or "[PAUSED]" in rest or "[AI WARN]" in rest:
+        return ts_part + yellow(rest)
+    elif "[AI]" in rest or "[CMD]" in rest:
+        return ts_part + cyan(rest)
+    elif "[DELAY]" in rest or "[CLEANUP]" in rest:
+        return ts_part + dim(rest)
+    else:
+        return ts_part + rest
+
+
 def add_log(msg):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     entry = f"[{ts}] {msg}"
     log_entries.append(entry)
     if len(log_entries) > MAX_LOG:
         log_entries.pop(0)
-    print(entry)
+    print(colorize_log(entry))
 
 
 def check_loop(task_id):
@@ -89,12 +127,33 @@ def apply_filters(message, filters):
         return (False, None)
 
     text = message.text or ""
-
-    blacklist = filters.get("blacklist_words", [])
     text_lower = text.lower()
+
+    # Whitelist check — message must contain at least one whitelist word
+    whitelist = filters.get("whitelist_words", [])
+    if whitelist:
+        found = False
+        for word in whitelist:
+            if word.lower() in text_lower:
+                found = True
+                break
+        if not found:
+            return (False, None)
+
+    # Blacklist check
+    blacklist = filters.get("blacklist_words", [])
     for word in blacklist:
         if word.lower() in text_lower:
             return (False, None)
+
+    # Regex blacklist check
+    regex_blacklist = filters.get("regex_blacklist", [])
+    for pattern in regex_blacklist:
+        try:
+            if re.search(pattern, text, re.IGNORECASE):
+                return (False, None)
+        except re.error:
+            pass
 
     modified = False
 
@@ -103,6 +162,17 @@ def apply_filters(message, filters):
         if w in text:
             text = text.replace(w, "")
             modified = True
+
+    # Regex clean
+    regex_clean = filters.get("regex_clean", [])
+    for pattern in regex_clean:
+        try:
+            new_text = re.sub(pattern, "", text)
+            if new_text != text:
+                text = new_text
+                modified = True
+        except re.error:
+            pass
 
     if filters.get("clean_urls"):
         new_text = re.sub(r"https?://\S+", "", text)
@@ -190,7 +260,10 @@ async def create_task(client):
         return val in ("y", "yes")
 
     blacklist = await prompt_list("Blacklist words")
+    whitelist = await prompt_list("Whitelist words (must match at least one)")
+    regex_blacklist = await prompt_list("Regex blacklist patterns")
     clean_words = await prompt_list("Clean words (remove from text)")
+    regex_clean = await prompt_list("Regex clean patterns (remove matches)")
     clean_urls = await prompt_bool("Remove URLs?")
     clean_usernames = await prompt_bool("Remove @usernames?")
     skip_images = await prompt_bool("Skip image messages?")
@@ -216,7 +289,10 @@ async def create_task(client):
         "enabled": True,
         "filters": {
             "blacklist_words": blacklist,
+            "whitelist_words": whitelist,
+            "regex_blacklist": regex_blacklist,
             "clean_words": clean_words,
+            "regex_clean": regex_clean,
             "clean_urls": clean_urls,
             "clean_usernames": clean_usernames,
             "skip_images": skip_images,
@@ -241,13 +317,20 @@ async def list_tasks():
         print("No tasks found.")
         return
 
-    print(f"\n{'ID':<5} {'Name':<20} {'Enabled':<8} {'Paused':<8} {'Source':<22} {'Destinations'}")
+    # Bold column headers (ANSI codes add invisible chars so we pad wider)
+    print(f"\n{bold('ID'):<14} {bold('Name'):<29} {bold('Enabled'):<17} {bold('Paused'):<17} {bold('Source'):<31} {bold('Destinations')}")
     print("-" * 100)
     for t in tasks:
-        status = "Yes" if t.get("enabled") else "No"
-        paused = "Yes" if t["id"] in paused_task_ids else "No"
+        enabled = t.get("enabled")
+        is_paused = t["id"] in paused_task_ids
+        status_str = green("Yes") if enabled else red("No")
+        paused_str = yellow("Yes") if is_paused else "No"
+        name_str = green(t['name']) if enabled else red(t['name'])
         dests = ", ".join(str(d) for d in t.get("destination_channel_ids", [t.get("destination_channel_id", "?")]))
-        print(f"{t['id']:<5} {t['name']:<20} {status:<8} {paused:<8} {t['source_channel_id']:<22} {dests}")
+        n_pad = " " * max(20 - len(t['name']), 1)
+        e_pad = " " * max(8 - 3, 1)
+        p_pad = " " * max(8 - 3, 1)
+        print(f"{t['id']:<5} {name_str}{n_pad}{status_str}{e_pad}{paused_str}{p_pad}{t['source_channel_id']:<22} {dests}")
 
 
 async def toggle_task():
@@ -274,7 +357,10 @@ async def edit_filters_submenu(task, data):
     filters = task.setdefault("filters", {})
     while True:
         bl = filters.get("blacklist_words", [])
+        wl = filters.get("whitelist_words", [])
+        rbl = filters.get("regex_blacklist", [])
         cw = filters.get("clean_words", [])
+        rcl = filters.get("regex_clean", [])
         print(f"\n  --- Filters: '{task['name']}' ---")
         print(f"  1. Blacklist words   : {', '.join(bl) or 'none'}")
         print(f"  2. Clean words       : {', '.join(cw) or 'none'}")
@@ -287,6 +373,9 @@ async def edit_filters_submenu(task, data):
         print(f"  9. Image delete days : {filters.get('image_delete_days', 0)}")
         rew_info = 'Enabled' if filters.get('rewrite_enabled') else 'Disabled'
         print(f"  10. AI Rewrite       : {rew_info}")
+        print(f"  11. Whitelist words  : {', '.join(wl) or 'none'}")
+        print(f"  12. Regex blacklist  : {', '.join(rbl) or 'none'}")
+        print(f"  13. Regex clean      : {', '.join(rcl) or 'none'}")
         print(f"  0. Done")
 
         sub = (await ainput("\n  Select filter to edit (0 to finish): ")).strip()
@@ -358,6 +447,24 @@ async def edit_filters_submenu(task, data):
             elif val in ("n", "no"):
                 filters["rewrite_enabled"] = False
             save_tasks(data)
+        elif sub == "11":
+            wl = filters.get("whitelist_words", [])
+            raw = (await ainput(f"    Words [{', '.join(wl) or 'none'}] (comma-sep, blank=clear): ")).strip()
+            filters["whitelist_words"] = [x.strip() for x in raw.split(",") if x.strip()] if raw else []
+            save_tasks(data)
+            print(f"    Saved: {filters['whitelist_words'] or 'none'}")
+        elif sub == "12":
+            rbl = filters.get("regex_blacklist", [])
+            raw = (await ainput(f"    Patterns [{', '.join(rbl) or 'none'}] (comma-sep, blank=clear): ")).strip()
+            filters["regex_blacklist"] = [x.strip() for x in raw.split(",") if x.strip()] if raw else []
+            save_tasks(data)
+            print(f"    Saved: {filters['regex_blacklist'] or 'none'}")
+        elif sub == "13":
+            rcl = filters.get("regex_clean", [])
+            raw = (await ainput(f"    Patterns [{', '.join(rcl) or 'none'}] (comma-sep, blank=clear): ")).strip()
+            filters["regex_clean"] = [x.strip() for x in raw.split(",") if x.strip()] if raw else []
+            save_tasks(data)
+            print(f"    Saved: {filters['regex_clean'] or 'none'}")
         elif sub == "0":
             break
         else:
@@ -568,15 +675,15 @@ async def start_forwarder(client):
                 text_to_rewrite = modified_text if modified_text is not None else getattr(event.message, 'text', '')
                 if text_to_rewrite and text_to_rewrite.strip():
                     try:
-                        import openrouter_client
-                        prompt = task.get("filters", {}).get("rewrite_prompt", "Rewrite this to avoid copyright.")
-                        add_log(f"  [AI] '{task['name']}' rewriting via OpenRouter...")
-                        rewritten = await openrouter_client.generate_with_openrouter(text_to_rewrite, system_prompt=prompt)
-                        if not rewritten.startswith("[AI Error:"):
+                        from rewriter import rewrite_text
+                        prompt = task.get("filters", {}).get("rewrite_prompt", None)
+                        add_log(f"  [AI] '{task['name']}' rewriting text...")
+                        rewritten = await rewrite_text(text_to_rewrite, prompt=prompt)
+                        if rewritten != text_to_rewrite:
                             modified_text = rewritten
-                            add_log(f"  [AI OK] Rewrote {len(text_to_rewrite)} chars to {len(rewritten)} chars.")
+                            add_log(f"  [AI OK] Rewrote {len(text_to_rewrite)} \u2192 {len(rewritten)} chars")
                         else:
-                            add_log(f"  [AI WARN] {rewritten}")
+                            add_log(f"  [AI WARN] Rewrite returned original text (all providers failed)")
                     except Exception as e:
                         add_log(f"  [AI ERR] {e}")
 
@@ -626,7 +733,7 @@ async def start_forwarder(client):
             return
         add_log(f"EDIT chat={event.chat_id} msg={event.message.id}")
         for entry in entries:
-            task = tasks_by_id.get(entry["task_id"])
+            task = next((t for t in load_tasks().get("tasks", []) if t["id"] == entry["task_id"]), None)
             if not task:
                 continue
             if entry["task_id"] in paused_task_ids:
@@ -787,28 +894,70 @@ async def view_logs():
     if not log_entries:
         print("No logs yet.")
         return
-    print(f"\n--- Logs (last {len(log_entries)} entries) ---")
-    for entry in log_entries[-50:]:  # show last 50
-        print(entry)
+
+    mode = (await ainput(f"\n{bold('View all logs or search?')} [a/s]: ")).strip().lower()
+
+    if mode == "s":
+        term = (await ainput("Search term: ")).strip()
+        if not term:
+            print("No search term entered.")
+            return
+        matches = [e for e in log_entries if term.lower() in e.lower()]
+        if not matches:
+            print(f"No log entries matching '{term}'.")
+            return
+        print(f"\n--- Logs matching '{term}' ({len(matches)} results) ---")
+        for entry in matches:
+            colored = colorize_log(entry)
+            # Highlight the search term in bold yellow (case-insensitive)
+            import re as _re
+            colored = _re.sub(
+                _re.escape(term),
+                lambda m: bold(yellow(m.group())),
+                colored,
+                flags=_re.IGNORECASE
+            )
+            print(colored)
+    else:
+        print(f"\n--- Logs (last {min(50, len(log_entries))} of {len(log_entries)} entries) ---")
+        for entry in log_entries[-50:]:
+            print(colorize_log(entry))
     print()
 
 
 async def view_statistics():
     data = load_tasks()
     tasks_by_id = {t["id"]: t for t in data.get("tasks", [])}
-    stats = db.get_statistics()
-    
+    stats = db.get_detailed_statistics()
+
     if not stats:
         print("No statistics available yet.")
         return
-        
-    print("\n--- Forwarding Statistics ---")
-    print(f"{'Task Name':<25} {'Total Msgs':<12} {'Images':<10} {'Last Active'}")
-    print("-" * 70)
+
+    print(f"\n{bold(cyan('--- Forwarding Statistics ---'))}")
+    print(f"{bold('Task Name'):<34} {bold('Total'):<17} {bold('Images'):<17} {bold('Today'):<17} {bold('Week'):<17} {bold('Last Active')}")
+    print("-" * 85)
+    total_msgs = 0
+    total_imgs = 0
     for row in stats:
         tname = tasks_by_id.get(row['task_id'], {}).get('name', f"Task {row['task_id']}")
-        last_act = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(row['last_active'])) if row['last_active'] else 'Never'
-        print(f"{tname:<25} {row['total_messages']:<12} {row['total_images'] or 0:<10} {last_act}")
+        last_act_ts = row['last_active']
+        last_act = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_act_ts)) if last_act_ts else 'Never'
+        today_count = row['today_count'] or 0
+        week_count = row['week_count'] or 0
+        total_msgs += row['total_messages']
+        total_imgs += (row['total_images'] or 0)
+        # Color indicator: green=active <1h, yellow=stale <24h, red=inactive
+        if last_act_ts and (time.time() - last_act_ts) < 3600:
+            tname_str = green(tname)
+        elif last_act_ts and (time.time() - last_act_ts) < 86400:
+            tname_str = yellow(tname)
+        else:
+            tname_str = red(tname)
+        n_pad = " " * max(25 - len(tname), 1)
+        print(f"{tname_str}{n_pad}{row['total_messages']:<8} {row['total_images'] or 0:<8} {today_count:<8} {week_count:<8} {last_act}")
+    print("-" * 85)
+    print(f"{bold('TOTAL'):<25} {bold(str(total_msgs)):<8} {bold(str(total_imgs)):<8}")
     print()
 
 async def view_threads():
@@ -848,15 +997,14 @@ async def generate_finance_report():
     amount = (await ainput("How many recent messages to analyze? [50]: ")).strip()
     limit = int(amount) if amount.isdigit() else 50
     
-    stats = db.get_threads(limit=1000)
-    task_msgs = [row for row in stats if row['task_id'] == task['id']][:limit]
-    
+    task_msgs = db.get_recent_messages(task['id'], limit)
+
     if not task_msgs:
         print("No recent messages found for this task.")
         return
-        
+
     print(f"\nGathering {len(task_msgs)} messages. Sending to OpenRouter AI...")
-    combined_text = "\n\n---\n\n".join([f"Time: {time.strftime('%Y-%m-%d %H:%M', time.localtime(msg['parent_time']))}\n{msg['text_content']}" for msg in task_msgs])
+    combined_text = "\n\n---\n\n".join([f"Time: {time.strftime('%Y-%m-%d %H:%M', time.localtime(msg['timestamp']))}\n{msg['text_content']}" for msg in task_msgs])
 
     system_prompt = (
         "You are an expert financial analyst. Review the provided trading signals and messages. "
@@ -874,26 +1022,87 @@ async def generate_finance_report():
     except Exception as e:
         print(f"Error communicating with OpenRouter: {e}")
 
+async def export_tasks():
+    data = load_tasks()
+    if not data.get("tasks"):
+        print("No tasks to export.")
+        return
+
+    default_name = f"tasks_backup_{datetime.datetime.now().strftime('%Y%m%d')}.json"
+    filename = (await ainput(f"Export filename [{default_name}]: ")).strip()
+    if not filename:
+        filename = default_name
+
+    try:
+        with open(filename, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"Exported {len(data['tasks'])} task(s) to '{filename}'.")
+    except IOError as e:
+        print(f"Export failed: {e}")
+
+
+async def import_tasks():
+    filename = (await ainput("Import filename: ")).strip()
+    if not filename:
+        print("No filename provided.")
+        return
+
+    if not os.path.exists(filename):
+        print(f"File '{filename}' not found.")
+        return
+
+    try:
+        with open(filename, "r") as f:
+            imported = json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"Failed to read file: {e}")
+        return
+
+    imported_tasks = imported.get("tasks", [])
+    if not imported_tasks:
+        print("No tasks found in import file.")
+        return
+
+    data = load_tasks()
+
+    added = 0
+    for t in imported_tasks:
+        new_id = next_task_id(data)
+        t["id"] = new_id
+        data["tasks"].append(t)
+        added += 1
+
+    save_tasks(data)
+    print(f"Imported {added} task(s). New IDs assigned to avoid conflicts.")
+
+
 async def main_menu(client):
     while True:
-        status = "RUNNING" if forwarder_active else "STOPPED"
-        paused_info = f" | Paused tasks: {sorted(paused_task_ids)}" if paused_task_ids else ""
-        print(f"\n=== TridenB Autoforwarder === [Forwarder: {status}{paused_info}]")
-        print("1.  Get Channel ID")
-        print("2.  Create Forwarding Task")
-        print("3.  List Tasks")
-        print("4.  Toggle Task (enable/disable)")
-        print("5.  Edit Task (source / destinations / filters)")
-        print("6.  Delete Task")
-        print("7.  Start Forwarder (background)")
-        print("8.  Stop Forwarder")
-        print("9.  Pause / Resume Task")
-        print("10. View Logs")
-        print("11. Duplicate Task")
-        print("12. View Statistics")
-        print("13. View Message Threads (Replies)")
-        print("14. Generate AI Finance Report")
-        print("0.  Exit")
+        status = green("RUNNING") if forwarder_active else red("STOPPED")
+        paused_info = f" | Paused: {yellow(str(sorted(paused_task_ids)))}" if paused_task_ids else ""
+        print(f"\n{bold(cyan('=== TridenB Autoforwarder ==='))} [Forwarder: {status}{paused_info}]")
+        print(dim("─────────────────────────────────────────────"))
+        print(f"  {cyan('1.')}  Get Channel ID")
+        print(f"  {cyan('2.')}  Create Forwarding Task")
+        print(f"  {cyan('3.')}  List Tasks")
+        print(f"  {cyan('4.')}  Toggle Task (enable/disable)")
+        print(f"  {cyan('5.')}  Edit Task (source / destinations / filters)")
+        print(f"  {cyan('6.')}  Delete Task")
+        print(f"  {cyan('11.')} Duplicate Task")
+        print(dim("─────────────────────────────────────────────"))
+        print(f"  {cyan('7.')}  Start Forwarder (background)")
+        print(f"  {cyan('8.')}  Stop Forwarder")
+        print(f"  {cyan('9.')}  Pause / Resume Task")
+        print(dim("─────────────────────────────────────────────"))
+        print(f"  {cyan('10.')} View Logs")
+        print(f"  {cyan('12.')} View Statistics")
+        print(f"  {cyan('13.')} View Message Threads (Replies)")
+        print(f"  {cyan('14.')} Generate AI Finance Report")
+        print(dim("─────────────────────────────────────────────"))
+        print(f"  {cyan('15.')} Export Tasks")
+        print(f"  {cyan('16.')} Import Tasks")
+        print(dim("─────────────────────────────────────────────"))
+        print(f"  {cyan('0.')}  Exit")
 
         choice = (await ainput("\nSelect option: ")).strip()
 
@@ -925,6 +1134,10 @@ async def main_menu(client):
             await view_threads()
         elif choice == "14":
             await generate_finance_report()
+        elif choice == "15":
+            await export_tasks()
+        elif choice == "16":
+            await import_tasks()
         elif choice == "0":
             if forwarder_active:
                 confirm = (await ainput("Forwarder is running. Stop and exit? [y/N]: ")).strip().lower()
@@ -956,7 +1169,11 @@ async def main():
         auto_reconnect=True       # Automatically reconnect
     )
     await client.start(phone=phone)
-    print("Authenticated successfully.")
+    print(green("Authenticated successfully."))
+    print(cyan("  ╔══════════════════════════════════════╗"))
+    print(cyan("  ║    TridenB Autoforwarder BETA V.2    ║"))
+    print(cyan("  ║         Telegram → Telegram          ║"))  
+    print(cyan("  ╚══════════════════════════════════════╝"))
     sync_paused_from_tasks()
 
     try:
